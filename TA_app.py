@@ -7,135 +7,225 @@ import re
 import torch
 from transformers import AutoTokenizer, AutoModelForSequenceClassification
 from scipy.special import softmax
+from datetime import datetime
+from io import BytesIO
 
-# Konfigurasi halaman
-st.set_page_config(page_title="Analisis Opini Twitter Indonesia", layout="wide")
+# ======= Konfigurasi Halaman =======
+st.set_page_config(page_title="Analisis Sentimen Twitter", layout="wide")
 
-# Muat model IndoBERT
+# ======= Sidebar =======
+st.sidebar.title("🔍 Analisis Sentimen Twitter")
+mode = st.sidebar.radio("Pilih Mode Input", ["Bearer Token", "Upload CSV"])
+
+if mode == "Bearer Token":
+    bearer_token = st.sidebar.text_input("Bearer Token Twitter")
+    query = st.sidebar.text_input("Kata kunci pencarian", value="")
+    max_results = st.sidebar.selectbox("Jumlah data yang ingin ditampilkan", [10, 50, 100])
+    fetch_button = st.sidebar.button("Ambil Data Twitter")
+else:
+    uploaded_file = st.sidebar.file_uploader("Upload file CSV", type=["csv"])
+
+# ======= Load Model & Tokenizer =======
 @st.cache_resource
 def load_model():
     tokenizer = AutoTokenizer.from_pretrained("indobenchmark/indobert-base-p1")
-    model = AutoModelForSequenceClassification.from_pretrained("mdhugol/indonesia-bert-sentiment-classification")
+    model = AutoModelForSequenceClassification.from_pretrained("indobenchmark/indobert-base-p1", num_labels=3)
     return tokenizer, model
 
 tokenizer, model = load_model()
-label_map = {0: 'Negatif', 1: 'Netral', 2: 'Positif'}
 
-# Header
-st.title("🇮🇩 Dashboard Analisis Sentimen Twitter/X")
-st.markdown("""
-Aplikasi ini menggunakan model IndoBERT untuk menganalisis sentimen tweet berbahasa Indonesia dari Twitter atau file CSV.
-""")
+# ======= Pustaka Kata Kasar =======
+kata_negatif = ['anjing', 'bangsat', 'goblok', 'tolol', 'bego', 'kampret', 'idiot','hama','jawir','jembut']
 
-# Sidebar
-st.sidebar.header("Konfigurasi")
-twitter_auth_token = st.sidebar.text_input("Twitter Bearer Token:", type="password")
-mode = st.sidebar.radio("Pilih Mode Data:", ["Ambil dari Twitter", "Upload File CSV"])
+# ======= Preprocessing =======
+def bersihkan_teks(teks):
+    teks = re.sub(r"http\S+", "", teks)
+    teks = re.sub(r"@\w+", "", teks)
+    teks = re.sub(r"#", "", teks)
+    teks = re.sub(r"\s+", " ", teks)
+    return teks.strip()
 
-# Fungsi analisis
-@st.cache_data
-def analisis_sentimen_indober(df):
-    results = []
-    for text in df['content']:
-        inputs = tokenizer(text, return_tensors="pt", truncation=True, padding=True)
+# ======= Ambil Tweet dari API =======
+def ambil_tweet(query, bearer_token, max_results):
+    headers = {"Authorization": f"Bearer {bearer_token}"}
+    url = "https://api.twitter.com/2/tweets/search/recent"
+    params = {
+        "query": query,
+        "tweet.fields": "created_at,author_id,text",
+        "expansions": "author_id",
+        "user.fields": "username",
+        "max_results": max_results
+    }
+    response = requests.get(url, headers=headers, params=params)
+    if response.status_code != 200:
+        st.error("Gagal mengambil data. Pastikan Bearer Token valid.")
+        return pd.DataFrame()
+
+    hasil = response.json()
+    pengguna = {u["id"]: u["username"] for u in hasil.get("includes", {}).get("users", [])}
+    data = []
+    for tweet in hasil.get("data", []):
+        teks = tweet["text"]
+        teks_bersih = bersihkan_teks(teks)
+        data.append({
+            "Tanggal": tweet["created_at"],
+            "Akun": pengguna.get(tweet["author_id"], "anonim"),
+            "Tweet": teks_bersih
+        })
+    return pd.DataFrame(data)
+
+# ======= Prediksi Sentimen =======
+def prediksi_sentimen(df):
+    hasil = []
+    for teks in df["Tweet"]:
+        if any(kasar in teks.lower() for kasar in kata_negatif):
+            hasil.append("Negatif")
+            continue
+
+        inputs = tokenizer(teks, return_tensors="pt", truncation=True, padding=True)
         with torch.no_grad():
             logits = model(**inputs).logits
-        probs = softmax(logits.numpy()[0])
-        label_idx = probs.argmax()
-        results.append(label_map[label_idx])
-    df['label'] = results
+        skor = softmax(logits.numpy()[0])
+        label = skor.argmax()
+        if label == 0:
+            hasil.append("Negatif")
+        elif label == 1:
+            hasil.append("Netral")
+        else:
+            hasil.append("Positif")
+    df["Sentimen"] = hasil
     return df
 
-def tampilkan_hasil(df):
-    df['content'] = df['content'].astype(str)
+# ======= WordCloud Generator =======
+def generate_wordcloud(df, sentimen=None):
+    if sentimen:
+        df = df[df["Sentimen"] == sentimen]
+    teks = " ".join(df["Tweet"].values)
+    if not teks.strip():
+        return None
+    wc = WordCloud(width=600, height=300, background_color='white').generate(teks)
+    return wc
 
-    st.write("### Contoh komentar", df.head())
-
-    st.write("### Distribusi Sentimen")
-    st.bar_chart(df['label'].value_counts())
-
-    st.write("### WordCloud")
-    all_text = " ".join(df['content'])
-    wordcloud = WordCloud(width=800, height=400, background_color='white').generate(all_text)
+# ======= Plot Kata Populer =======
+def plot_kata_populer(df):
+    all_words = " ".join(df["Tweet"]).lower().split()
+    freq = pd.Series(all_words).value_counts().head(10)
     fig, ax = plt.subplots()
-    ax.imshow(wordcloud, interpolation='bilinear')
-    ax.axis('off')
-    st.pyplot(fig)
+    freq.plot(kind='bar', ax=ax, color="skyblue")
+    ax.set_title("10 Kata Paling Sering Muncul")
+    return fig
 
-    csv = df.to_csv(index=False, encoding='utf-8-sig')
-    st.download_button(
-        label="\U0001F4E5 Download Hasil CSV",
-        data=csv,
-        file_name='hasil_sentimen_indonesia.csv',
-        mime='text/csv',
-    )
+# ======= Main Area =======
+st.title("📊 Analisis Sentimen Twitter/X")
 
-# Mode Ambil dari Twitter
-if mode == "Ambil dari Twitter":
-    keyword = st.text_input("Masukkan Kata Kunci:")
-    jumlah = st.slider("Jumlah Tweet:", 10, 100, 30)
+def buat_download(dataframe, nama_file):
+    buffer = BytesIO()
+    dataframe.to_csv(buffer, index=False)
+    buffer.seek(0)
+    st.download_button(f"⬇️ Download {nama_file}", data=buffer, file_name=nama_file, mime="text/csv")
 
-    if st.button("Ambil dan Analisis Tweet"):
-        if not twitter_auth_token:
-            st.error("Silakan masukkan Bearer Token.")
-        elif not keyword:
-            st.warning("Masukkan kata kunci terlebih dahulu.")
-        elif any(ord(c) > 127 for c in keyword):
-            st.error("Kata kunci tidak boleh mengandung emoji atau karakter non-ASCII.")
-        else:
-            with st.spinner("Mengambil tweet..."):
-                headers = {
-                    "Authorization": f"Bearer {twitter_auth_token}",
-                    "User-Agent": "StreamlitApp"
-                }
-                # Kata kunci + bahasa Indonesia + hanya tweet asli (bukan reply/retweet)
-                query = re.sub(r'[^\w\s]', '', keyword) + " lang:id -is:retweet -is:reply"
-                url = f"https://api.twitter.com/2/tweets/search/recent?query={query}&max_results={jumlah}&tweet.fields=created_at,text,lang"
+if mode == "Bearer Token" and fetch_button:
+    data = ambil_tweet(query, bearer_token, max_results)
+    if not data.empty:
+        data_asli = data.copy()
+        data = prediksi_sentimen(data)
+        st.subheader(f"Hasil Analisis Tweet '{query}'")
+        st.dataframe(data)
 
-                try:
-                    response = requests.get(url, headers=headers)
-                    if response.status_code == 200:
-                        tweets = response.json().get("data", [])
-                        if tweets:
-                            df = pd.DataFrame(tweets)
-                            df.rename(columns={"created_at": "date", "text": "content"}, inplace=True)
-                            df = df[["date", "content"]]
-                            df = analisis_sentimen_indober(df)
-                            tampilkan_hasil(df)
-                        else:
-                            st.warning("Tidak ada tweet ditemukan untuk kata kunci tersebut.")
-                    elif response.status_code == 401:
-                        st.error("Token tidak valid atau tidak memiliki izin.")
-                    elif response.status_code == 429:
-                        st.error("Terlalu banyak permintaan. Tunggu beberapa saat dan coba lagi.")
-                    else:
-                        st.error(f"Gagal mengambil data. Status: {response.status_code}")
-                except Exception as e:
-                    st.error(f"Terjadi kesalahan: {e}")
+        # Grafik Sentimen
+        st.subheader("Grafik Sentimen")
+        sentimen_count = data["Sentimen"].value_counts()
+        fig1, ax1 = plt.subplots()
+        sentimen_count.plot(kind="bar", ax=ax1, color=["red", "gray", "green"])
+        ax1.set_ylabel("Jumlah")
+        ax1.set_title("Distribusi Sentimen")
+        st.pyplot(fig1)
 
-# Mode Upload CSV
-elif mode == "Upload File CSV":
-    uploaded_file = st.file_uploader("Unggah file CSV yang berisi kolom 'content' atau 'full_text'", type="csv")
-    if uploaded_file:
-        try:
-            try:
-                df = pd.read_csv(uploaded_file, encoding='utf-8')
-            except UnicodeDecodeError:
-                df = pd.read_csv(uploaded_file, encoding='ISO-8859-1')
+        # Pie Chart
+        st.subheader("Pie Chart Sentimen")
+        fig2, ax2 = plt.subplots()
+        ax2.pie(sentimen_count, labels=sentimen_count.index, autopct="%1.1f%%", colors=["red", "gray", "green"])
+        ax2.axis("equal")
+        st.pyplot(fig2)
 
-            # Deteksi kolom teks
-            text_col = None
-            if 'content' in df.columns:
-                text_col = 'content'
-            elif 'full_text' in df.columns:
-                text_col = 'full_text'
+        # Wordcloud
+        st.subheader("Wordcloud Berdasarkan Sentimen")
+        col1, col2 = st.columns(2)
+        with col1:
+            for label in ["Positif", "Negatif"]:
+                st.markdown(f"**{label}**")
+                wc = generate_wordcloud(data, label)
+                if wc:
+                    fig, ax = plt.subplots()
+                    ax.imshow(wc, interpolation="bilinear")
+                    ax.axis("off")
+                    st.pyplot(fig)
+        with col2:
+            st.markdown("**Netral**")
+            wc_neutral = generate_wordcloud(data, "Netral")
+            if wc_neutral:
+                fig, ax = plt.subplots()
+                ax.imshow(wc_neutral, interpolation="bilinear")
+                ax.axis("off")
+                st.pyplot(fig)
 
-            if not text_col:
-                st.error("Tidak ditemukan kolom 'content' atau 'full_text' dalam file CSV.")
-            else:
-                df = df[[text_col]].rename(columns={text_col: 'content'})
-                df = analisis_sentimen_indober(df)
-                tampilkan_hasil(df)
+            st.markdown("**Gabungan**")
+            wc_all = generate_wordcloud(data)
+            if wc_all:
+                fig, ax = plt.subplots()
+                ax.imshow(wc_all, interpolation="bilinear")
+                ax.axis("off")
+                st.pyplot(fig)
 
-        except Exception as e:
-            st.error(f"Gagal membaca file: {e}")
+        # Kata Populer
+        st.subheader("🔠 Kata Paling Sering Muncul")
+        st.pyplot(plot_kata_populer(data))
+
+        # ======= Download Section =======
+        st.subheader("📥 Unduh Data")
+        buat_download(data, "hasil_twitter_analisis.csv")
+        buat_download(data_asli, "data_asli.csv")
+        buat_download(data[["Akun", "Tanggal", "Tweet"]], "data_bersih.csv")
+
+elif mode == "Upload CSV" and uploaded_file:
+    df_csv = pd.read_csv(uploaded_file)
+    if "Tweet" not in df_csv.columns:
+        st.error("File CSV harus memiliki kolom bernama 'Tweet'")
+    else:
+        df_csv_asli = df_csv.copy()
+        df_csv["Tweet"] = df_csv["Tweet"].astype(str).apply(bersihkan_teks)
+        df_csv = prediksi_sentimen(df_csv)
+        st.subheader("Hasil Analisis dari File CSV")
+        st.dataframe(df_csv)
+
+        st.subheader("Grafik Sentimen")
+        sentimen_count = df_csv["Sentimen"].value_counts()
+        fig1, ax1 = plt.subplots()
+        sentimen_count.plot(kind="bar", ax=ax1, color=["red", "gray", "green"])
+        ax1.set_ylabel("Jumlah")
+        ax1.set_title("Distribusi Sentimen")
+        st.pyplot(fig1)
+
+        # Wordcloud Gabungan
+        st.subheader("Wordcloud Semua Sentimen")
+        wc_csv = generate_wordcloud(df_csv)
+        if wc_csv:
+            fig, ax = plt.subplots()
+            ax.imshow(wc_csv, interpolation="bilinear")
+            ax.axis("off")
+            st.pyplot(fig)
+
+        # Kata Populer
+        st.subheader("🔠 Kata Paling Sering Muncul")
+        st.pyplot(plot_kata_populer(df_csv))
+
+        # ======= Download Section =======
+        st.subheader("📥 Unduh Data")
+        buat_download(df_csv, "hasil_analisis.csv")
+        buat_download(df_csv_asli, "data_asli.csv")
+        df_download = df_csv.copy()
+        if "Akun" not in df_download.columns:
+            df_download["Akun"] = "-"
+        if "Tanggal" not in df_download.columns:
+            df_download["Tanggal"] = "-"
+        buat_download(df_download[["Akun", "Tanggal", "Tweet"]], "data_bersih.csv")
